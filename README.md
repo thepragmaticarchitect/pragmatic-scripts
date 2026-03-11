@@ -1,37 +1,34 @@
-## Welcome to GitHub Pages
+# Public Shared Scripts
 
-You can use the [editor on GitHub](https://github.com/viny1122/publicSharedScripts/edit/master/README.md) to maintain and preview the content for your website in Markdown files.
+Practical PowerShell and cloud utility scripts for infrastructure reporting, automation, and operational support.
 
-Whenever you commit to this repository, GitHub Pages will run [Jekyll](https://jekyllrb.com/) to rebuild the pages in your site, from the content in your Markdown files.
+This repository contains reusable scripts and examples focused on:
+- database/user reporting
+- HTML report generation
+- cloud cost and utilization checks
+- operational automation patterns
 
-### Markdown
+## Repository Contents
 
-Markdown is a lightweight and easy-to-use syntax for styling your writing. It includes conventions for
+### Get-DBUserReport
+PowerShell scripts to extract and format database user/access information.
 
-```markdown
-Syntax highlighted code block
+### HTMLTable.ps1
+Reusable helper for converting output into HTML table format for operational reporting.
 
-# Header 1
-## Header 2
-### Header 3
+### ec2_idle_finder.py
+Utility for identifying underutilized EC2 resources for cleanup or cost optimization.
 
-- Bulleted
-- List
+## Why this repo exists
+I use this repository to share small, practical scripts that solve real infrastructure and operations problems.
 
-1. Numbered
-2. List
+## Requirements
+- PowerShell 5.1+ or PowerShell 7+
+- AWS CLI / required modules where applicable
+- Appropriate credentials and permissions
 
-**Bold** and _Italic_ and `Code` text
+## Usage
+Include example commands here.
 
-[Link](url) and ![Image](src)
-```
-
-For more details see [GitHub Flavored Markdown](https://guides.github.com/features/mastering-markdown/).
-
-### Jekyll Themes
-
-Your Pages site will use the layout and styles from the Jekyll theme you have selected in your [repository settings](https://github.com/viny1122/publicSharedScripts/settings). The name of this theme is saved in the Jekyll `_config.yml` configuration file.
-
-### Support or Contact
-
-Having trouble with Pages? Check out our [documentation](https://help.github.com/categories/github-pages-basics/) or [contact support](https://github.com/contact) and we’ll help you sort it out.
+## Notes
+These scripts are provided as public examples and may require environment-specific adjustments before production use.
