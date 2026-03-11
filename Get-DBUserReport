@@ -1,0 +1,367 @@
+<#
+.SYNOPSIS
+    Audits database logins, mapped users, last login time, and permissions
+    across RDS MySQL, SQL Server (RDS), and Azure SQL.
+
+.DESCRIPTION
+    Connects to a target database and pulls:
+      - Logins and mapped users
+      - Last login timestamp (where available)
+      - Granted permissions / roles
+
+    Outputs a CSV report per run.
+
+.REQUIREMENTS
+    MySQL    : Install-Module -Name MySql.Data  OR have mysql.exe in PATH
+    SQL Server / Azure SQL : SqlServer module
+        Install-Module -Name SqlServer
+
+.EXAMPLES
+    # RDS MySQL
+    .\Get-DBUserAudit.ps1 -Platform MySQL -Server mydb.abc123.us-east-1.rds.amazonaws.com `
+        -Database myapp -Username admin -OutputCsv mysql_audit.csv
+
+    # RDS SQL Server
+    .\Get-DBUserAudit.ps1 -Platform MSSQL -Server mydb.abc123.us-east-1.rds.amazonaws.com `
+        -Database myapp -Username sa -OutputCsv mssql_audit.csv
+
+    # Azure SQL
+    .\Get-DBUserAudit.ps1 -Platform AzureSQL -Server myserver.database.windows.net `
+        -Database myapp -Username sqladmin -OutputCsv azuresql_audit.csv
+
+    # Prompt for password securely (recommended)
+    .\Get-DBUserAudit.ps1 -Platform MySQL -Server mydb.rds.amazonaws.com -Database myapp -Username admin
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)]
+    [ValidateSet("MySQL", "MSSQL", "AzureSQL")]
+    [string] $Platform,
+
+    [Parameter(Mandatory)]
+    [string] $Server,
+
+    [Parameter(Mandatory)]
+    [string] $Database,
+
+    [Parameter(Mandatory)]
+    [string] $Username,
+
+    [int]    $Port      = 0,       # 0 = use platform default
+    [string] $OutputCsv = "db_user_audit_$(Get-Date -Format 'yyyyMMdd_HHmm').csv",
+
+    [SecureString] $Password       # If omitted, you'll be prompted
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# ── Password prompt ───────────────────────────────────────────────────────────
+if (-not $Password) {
+    $Password = Read-Host "Password for $Username" -AsSecureString
+}
+
+function Resolve-PlainText([SecureString]$secure) {
+    [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    )
+}
+
+$plainPw = Resolve-PlainText $Password
+
+# ── MySQL via mysql CLI ───────────────────────────────────────────────────────
+function Invoke-MySQLQuery {
+    param([string]$Query)
+
+    $resolvedPort = if ($Port -ne 0) { $Port } else { 3306 }
+
+    # mysql CLI must be in PATH (comes with MySQL client tools or RDS proxy)
+    $env:MYSQL_PWD = $plainPw
+    $raw = mysql `
+        --host=$Server `
+        --port=$resolvedPort `
+        --user=$Username `
+        --database=$Database `
+        --batch `
+        --silent `
+        --execute=$Query 2>&1
+    $env:MYSQL_PWD = $null
+
+    if ($LASTEXITCODE -ne 0) { throw "MySQL query failed: $raw" }
+    return $raw
+}
+
+function Parse-MySQLTabular([string[]]$lines) {
+    if (-not $lines -or $lines.Count -lt 2) { return @() }
+    $headers = $lines[0] -split "`t"
+    $rows = @()
+    foreach ($line in $lines[1..($lines.Count - 1)]) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $cols = $line -split "`t"
+        $obj  = [ordered]@{}
+        for ($i = 0; $i -lt $headers.Count; $i++) {
+            $obj[$headers[$i]] = if ($i -lt $cols.Count) { $cols[$i] } else { "" }
+        }
+        $rows += [PSCustomObject]$obj
+    }
+    return $rows
+}
+
+function Get-MySQL-Users {
+    Write-Host "  Pulling MySQL users and grants..." -ForegroundColor DarkGray
+
+    # Users + host + password plugin + account lock status
+    $userQuery = @"
+SELECT
+    u.User                          AS login_name,
+    u.Host                          AS host,
+    u.plugin                        AS auth_plugin,
+    u.account_locked                AS account_locked,
+    u.password_expired              AS password_expired,
+    u.password_last_changed         AS password_last_changed,
+    u.Create_priv,
+    u.Drop_priv,
+    u.Grant_priv,
+    u.Super_priv,
+    u.Repl_slave_priv,
+    u.Repl_client_priv
+FROM mysql.user u
+ORDER BY u.User, u.Host;
+"@
+
+    $userLines = Invoke-MySQLQuery -Query $userQuery
+    $users     = Parse-MySQLTabular -lines ($userLines -split "`n")
+
+    # Per-user SHOW GRANTS
+    $results = @()
+    foreach ($u in $users) {
+        $grantsRaw  = Invoke-MySQLQuery -Query "SHOW GRANTS FOR '$($u.login_name)'@'$($u.host)';"
+        $grantsText = ($grantsRaw -split "`n" | Where-Object { $_ -match "GRANT" }) -join " | "
+
+        $results += [PSCustomObject]@{
+            Platform             = "MySQL (RDS)"
+            Server               = $Server
+            Database             = $Database
+            LoginName            = $u.login_name
+            Host                 = $u.host
+            MappedUser           = $u.login_name   # MySQL: login = user
+            AuthPlugin           = $u.auth_plugin
+            AccountLocked        = $u.account_locked
+            PasswordExpired      = $u.password_expired
+            PasswordLastChanged  = $u.password_last_changed
+            LastLoginTime        = "N/A (enable general_log or use performance_schema)"
+            Grants               = $grantsText
+        }
+    }
+
+    # Last login from performance_schema if available
+    try {
+        $loginQuery = @"
+SELECT user, host, MAX(event_time) AS last_login
+FROM performance_schema.events_statements_history_long
+WHERE sql_text IS NOT NULL
+GROUP BY user, host;
+"@
+        $loginLines = Invoke-MySQLQuery -Query $loginQuery
+        $logins     = Parse-MySQLTabular -lines ($loginLines -split "`n")
+
+        foreach ($row in $results) {
+            $match = $logins | Where-Object { $_.user -eq $row.LoginName -and $_.host -eq $row.Host }
+            if ($match) { $row.LastLoginTime = $match.last_login }
+        }
+    } catch {
+        Write-Host "  Note: performance_schema last_login not available — skipping." -ForegroundColor DarkYellow
+    }
+
+    return $results
+}
+
+# ── SQL Server / Azure SQL via SqlServer module ───────────────────────────────
+function Invoke-SqlQuery {
+    param([string]$Query, [string]$Db = $Database)
+
+    $resolvedPort = if ($Port -ne 0) { $Port } else { 1433 }
+    $connStr = if ($Platform -eq "AzureSQL") {
+        "Server=tcp:$Server,$resolvedPort;Initial Catalog=$Db;User ID=$Username;Password=$plainPw;Encrypt=True;TrustServerCertificate=False;"
+    } else {
+        "Server=$Server,$resolvedPort;Database=$Db;User ID=$Username;Password=$plainPw;Encrypt=True;TrustServerCertificate=True;"
+    }
+
+    $conn = New-Object System.Data.SqlClient.SqlConnection $connStr
+    $conn.Open()
+
+    $cmd    = $conn.CreateCommand()
+    $cmd.CommandText    = $Query
+    $cmd.CommandTimeout = 60
+
+    $adapter = New-Object System.Data.SqlClient.SqlDataAdapter $cmd
+    $ds      = New-Object System.Data.DataSet
+    $adapter.Fill($ds) | Out-Null
+    $conn.Close()
+
+    return $ds.Tables[0]
+}
+
+function Get-MSSQL-Users {
+    Write-Host "  Pulling SQL Server logins and users..." -ForegroundColor DarkGray
+
+    # Server-level logins
+    $loginQuery = @"
+SELECT
+    sp.name                         AS login_name,
+    sp.type_desc                    AS login_type,
+    sp.is_disabled                  AS is_disabled,
+    sp.create_date                  AS created_date,
+    sp.modify_date                  AS modified_date,
+    ISNULL(sl.denylogin, 0)        AS login_denied,
+    LOGINPROPERTY(sp.name, 'PasswordLastSetTime') AS password_last_set,
+    LOGINPROPERTY(sp.name, 'IsExpired')           AS password_expired,
+    LOGINPROPERTY(sp.name, 'IsLocked')            AS is_locked
+FROM sys.server_principals sp
+LEFT JOIN sys.syslogins sl ON sp.sid = sl.sid
+WHERE sp.type NOT IN ('R')   -- exclude server roles
+ORDER BY sp.name;
+"@
+
+    # DB-level users mapped to logins
+    $userQuery = @"
+SELECT
+    dp.name                         AS db_user,
+    dp.type_desc                    AS user_type,
+    sp.name                         AS mapped_login,
+    dp.create_date,
+    dp.modify_date,
+    dp.default_schema_name
+FROM sys.database_principals dp
+LEFT JOIN sys.server_principals sp ON dp.sid = sp.sid
+WHERE dp.type NOT IN ('R')   -- exclude db roles
+ORDER BY dp.name;
+"@
+
+    # Role memberships
+    $roleQuery = @"
+SELECT
+    dp.name     AS db_user,
+    rp.name     AS role_name
+FROM sys.database_role_members drm
+JOIN sys.database_principals dp ON drm.member_principal_id = dp.principal_id
+JOIN sys.database_principals rp ON drm.role_principal_id   = rp.principal_id
+ORDER BY dp.name;
+"@
+
+    # Object-level permissions
+    $permQuery = @"
+SELECT
+    dp.name             AS db_user,
+    perm.state_desc     AS permission_state,
+    perm.permission_name,
+    ISNULL(obj.name, 'DATABASE') AS object_name,
+    ISNULL(obj.type_desc, '')    AS object_type
+FROM sys.database_permissions perm
+JOIN sys.database_principals dp  ON perm.grantee_principal_id = dp.principal_id
+LEFT JOIN sys.objects obj        ON perm.major_id = obj.object_id
+WHERE dp.type NOT IN ('R')
+ORDER BY dp.name, perm.permission_name;
+"@
+
+    # Last login from sys.dm_exec_sessions / logon audit
+    $lastLoginQuery = @"
+SELECT
+    login_name,
+    MAX(login_time) AS last_login_time
+FROM sys.dm_exec_sessions
+GROUP BY login_name;
+"@
+
+    $logins    = Invoke-SqlQuery -Query $loginQuery   -Db "master"
+    $dbUsers   = Invoke-SqlQuery -Query $userQuery
+    $roles     = Invoke-SqlQuery -Query $roleQuery
+    $perms     = Invoke-SqlQuery -Query $permQuery
+
+    $lastLogins = $null
+    try {
+        $lastLogins = Invoke-SqlQuery -Query $lastLoginQuery -Db "master"
+    } catch {
+        Write-Host "  Note: dm_exec_sessions not accessible — last login skipped." -ForegroundColor DarkYellow
+    }
+
+    # Build role map per user
+    $roleMap = @{}
+    foreach ($row in $roles) {
+        $key = $row.db_user
+        if (-not $roleMap[$key]) { $roleMap[$key] = @() }
+        $roleMap[$key] += $row.role_name
+    }
+
+    # Build permission map per user
+    $permMap = @{}
+    foreach ($row in $perms) {
+        $key = $row.db_user
+        if (-not $permMap[$key]) { $permMap[$key] = @() }
+        $permMap[$key] += "$($row.permission_state) $($row.permission_name) ON $($row.object_name)"
+    }
+
+    # Build last login map
+    $loginTimeMap = @{}
+    if ($lastLogins) {
+        foreach ($row in $lastLogins) {
+            $loginTimeMap[$row.login_name] = $row.last_login_time
+        }
+    }
+
+    $results = @()
+
+    foreach ($u in $dbUsers) {
+        $mappedLogin = $u.mapped_login
+        $loginRow    = $logins | Where-Object { $_.login_name -eq $mappedLogin } | Select-Object -First 1
+
+        $results += [PSCustomObject]@{
+            Platform            = if ($Platform -eq "AzureSQL") { "Azure SQL" } else { "SQL Server (RDS)" }
+            Server              = $Server
+            Database            = $Database
+            LoginName           = $mappedLogin ?? "—"
+            LoginType           = $loginRow?.login_type ?? "—"
+            IsDisabled          = $loginRow?.is_disabled ?? "—"
+            LoginDenied         = $loginRow?.login_denied ?? "—"
+            IsLocked            = $loginRow?.is_locked ?? "—"
+            PasswordExpired     = $loginRow?.password_expired ?? "—"
+            PasswordLastSet     = $loginRow?.password_last_set ?? "—"
+            MappedDbUser        = $u.db_user
+            UserType            = $u.user_type
+            DefaultSchema       = $u.default_schema_name
+            LastLoginTime       = $loginTimeMap[$mappedLogin] ?? "Not in active sessions"
+            Roles               = ($roleMap[$u.db_user] -join " | ") ?? "—"
+            Permissions         = ($permMap[$u.db_user] -join " | ") ?? "—"
+        }
+    }
+
+    return $results
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+Write-Host ""
+Write-Host "── DB User Audit ─────────────────────────────────" -ForegroundColor Cyan
+Write-Host "  Platform : $Platform"
+Write-Host "  Server   : $Server"
+Write-Host "  Database : $Database"
+Write-Host ""
+
+$results = switch ($Platform) {
+    "MySQL"    { Get-MySQL-Users }
+    "MSSQL"    { Get-MSSQL-Users }
+    "AzureSQL" { Get-MSSQL-Users }   # same T-SQL surface, different conn string
+}
+
+# Summary
+Write-Host ""
+Write-Host "  Total accounts found: $($results.Count)" -ForegroundColor Yellow
+
+# CSV export
+$results | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+Write-Host "  Report saved → $OutputCsv" -ForegroundColor Green
+Write-Host ""
+
+# Quick console preview (top 20)
+$results | Select-Object -First 20 `
+    | Format-Table LoginName, MappedDbUser, LastLoginTime, Roles -AutoSize
