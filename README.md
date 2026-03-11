@@ -1,6 +1,6 @@
 # Public Shared Scripts
 
-Practical PowerShell and cloud utility scripts for infrastructure reporting, automation, and operational support.
+Practical PowerShell\Python and cloud utility scripts for infrastructure reporting, automation, and operational support.
 
 This repository contains reusable scripts and examples focused on:
 - database/user reporting
